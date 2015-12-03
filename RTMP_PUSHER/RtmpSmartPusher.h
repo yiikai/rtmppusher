@@ -6,38 +6,52 @@
 #include <pthread.h>
 #include <list>
 using namespace std;
+
+typedef struct h264metadata
+{
+	unsigned char* sps;
+	int sps_size;
+	unsigned char* pps;
+	int pps_size;
+}h264metadata_st;
+
 class RtmpSmartPusher
 {
 	public:
 		RtmpSmartPusher();
 		~RtmpSmartPusher();
 		bool Init(char* rtmpurl);
+		bool startPush();
+
 	private:
-		bool SendH264();
-		bool SendAAC();
+		bool StartPusherH264();
+		bool StartPusherAAC();
+		bool senAudioSpecificConfig();
+		bool SendAACPacket(unsigned char *data,unsigned int size,unsigned int nTimeStamp);
+		bool connectRtmpServer(char* rtmpurl);
 		void getSPSAndPPS(const unsigned char* sps_pps_data,int size);
-		int SendPacket(unsigned int nPacketType,unsigned char *data,unsigned int size,unsigned int nTimestamp);
-		bool SendH264Packet(unsigned char *data,unsigned int size,bool bIsKeyFrame,unsigned int nTimeStamp);
-		bool SendAACPacket(unsigned char *data,unsigned int size,bool bIsKeyFrame,unsigned int nTimeStamp);
-		bool SendAVPacketToServer(RTMPPacket& packet);
-		static void* audio_packet(void *arg);
-		static void* video_packet(void *arg);
-		static void* push_packet(void* arg);
+		bool sendRtmp264Packet(unsigned char* data, int size , bool iskeyframe,int nTimeStamp);
+		bool sendPacket(unsigned int nPacketType,unsigned char *data,unsigned int size,unsigned int nTimestamp);
+		bool sendRtmpspsppsPacket(unsigned char* sps, int sps_size,unsigned char* pps , int pps_size);
+		bool popQueueAndSendPacket();
+		static void* do_video_push_thread(void* arg);
+		static void* do_audio_push_thread(void* arg);
+		static void* do_queue_push_thread(void* arg);
 	private:
 		RTMP *m_rtmp;
-		pthread_t m_audiopacket_encode_thread;
-		pthread_t m_videopacket_encode_thread;
-		pthread_t m_sendAVPacket_thread;
-		pthread_mutex_t bufferlck;
-		
-		list<RTMPPacket> m_Queue;
-		//vector<RTMPPacket*> m_Queue;
+		h264metadata_st m_264metadata;
 
-		int m_currentAudioTime;
-		int m_currentVideoTime;
+		pthread_t m_videoThread;
+		pthread_t m_audioThread;
+		pthread_t m_pushThread;
+		pthread_mutex_t m_lck;
+		pthread_mutex_t m_queuelck;
 		pthread_cond_t cv;
-		pthread_mutex_t audio_video_put_mutex;
-
+		list<RTMPPacket*> m_packetQueue;
+		int m_audiotime;
+		int m_videotime;
+		int m_audioover;
+		int m_videoover;
 };
 
 #endif

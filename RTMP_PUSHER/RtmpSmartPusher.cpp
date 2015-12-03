@@ -8,64 +8,27 @@ extern "C"
 #include <libavcodec/avcodec.h>
 }
 
-void* RtmpSmartPusher::audio_packet(void *arg)
-{
-	RtmpSmartPusher* pusher = (RtmpSmartPusher*)arg;
-	pusher->SendAAC();
-}
+#define RTMP_HEAD_SIZE   (sizeof(RTMPPacket)+RTMP_MAX_HEADER_SIZE)
 
-void* RtmpSmartPusher::video_packet(void *arg)
+RtmpSmartPusher::RtmpSmartPusher():m_rtmp(NULL),m_audiotime(0),m_videotime(0),m_audioover(0),m_videoover(0)
 {
-	RtmpSmartPusher* pusher = (RtmpSmartPusher*)arg;
-	pusher->SendH264();
-}
-
-void* RtmpSmartPusher::push_packet(void* arg)
-{
-	RtmpSmartPusher* pusher = (RtmpSmartPusher*)arg;
-	while(1)
-	{
-		if(pusher->m_Queue.empty())
-		{
-			continue;
-		}
-		else
-		{
-			pthread_mutex_lock(&(pusher->bufferlck));
-			RTMPPacket item = pusher->m_Queue.front();
-			if(item.m_packetType == RTMP_PACKET_TYPE_VIDEO)
-			{
-				//cout<<"video pts is "<<item.m_nTimeStamp<<endl;
-			}
-			else
-			{
-				//cout<<"audio pts is "<<item.m_nTimeStamp<<endl;
-			}
-			pusher->SendAVPacketToServer(item);
-			pusher->m_Queue.pop_front();
-			pthread_mutex_unlock(&(pusher->bufferlck));
-		}
-	}
-}
-
-bool RtmpSmartPusher::SendAVPacketToServer(RTMPPacket& packet)
-{
-	RTMP_SendPacket(m_rtmp,&packet,0);  
-	RTMPPacket_Free(&packet);  
-	return true;
-}
-
-RtmpSmartPusher::RtmpSmartPusher():m_rtmp(NULL),m_currentAudioTime(0),m_currentVideoTime(0)
-{
-
+	memset(&m_264metadata,0,sizeof(h264metadata));
 }
 
 RtmpSmartPusher::~RtmpSmartPusher()
 {
-   
+
 }
 
 bool RtmpSmartPusher::Init(char* rtmpurl)
+{
+	pthread_mutex_init(&m_lck,NULL);
+	pthread_mutex_init(&m_queuelck,NULL);
+	pthread_cond_init(&cv,NULL);
+	connectRtmpServer(rtmpurl);
+}
+
+bool RtmpSmartPusher::connectRtmpServer(char* rtmpurl)
 {
 		m_rtmp = RTMP_Alloc();
 		if(!m_rtmp)
@@ -90,153 +53,232 @@ bool RtmpSmartPusher::Init(char* rtmpurl)
 				cout<<"Connect stream with RTMP error"<<endl;
 				return false;
 		}
-		int ret = 0;
-		pthread_mutex_init(&bufferlck,NULL);
-		pthread_mutex_init(&audio_video_put_mutex,NULL);
-		pthread_cond_init(&cv,NULL);
-		ret = pthread_create(&m_audiopacket_encode_thread,NULL,audio_packet,this);
-		if(ret != 0)
-			return false;
-		ret = pthread_create(&m_videopacket_encode_thread,NULL,video_packet,this);
-		if(ret != 0)
-			return false;
-		ret = pthread_create(&m_sendAVPacket_thread,NULL,push_packet,this);
-		if(ret != 0)
-			return false;
-		
-		//SendAAC();
-		//SendH264();
-		pthread_join(m_audiopacket_encode_thread,NULL);
-		pthread_join(m_videopacket_encode_thread,NULL);
-		pthread_join(m_sendAVPacket_thread,NULL);
-
-		cout<<"send data over"<<endl;
-		return true;
-} 
-
-bool RtmpSmartPusher::SendAAC()
-{
 		av_register_all();
-		AVFormatContext *pFormatCtx = NULL;
-		AVCodecContext *pCodecCtx = NULL;
-		AVCodec *pCodec = NULL;
-
-		pFormatCtx = avformat_alloc_context();
-		if(pFormatCtx == NULL)
-		{
-				cout<<"alloc format error"<<endl;
-				return false;
-		}
-		if(avformat_open_input(&pFormatCtx,"audio.aac",NULL,NULL) != 0)
-		{
-				cout<<"open input file error"<<endl;
-				return false;
-		}
-		if(avformat_find_stream_info(pFormatCtx,NULL) < 0 )
-		{
-				cout<<"find stream info error"<<endl;
-				return false;
-		}
-		int audioindex = -1;
-		for(int i = 0; i < pFormatCtx->nb_streams;i++)
-		{
-				if(pFormatCtx->streams[i]->codec->codec_type == AVMEDIA_TYPE_AUDIO)
-				{
-						audioindex = i;
-						break;
-				}
-		}
-		if(audioindex == -1)
-		{
-				cout<<"can't find any video"<<endl;
-				return false;
-		}
-		pCodecCtx = pFormatCtx->streams[audioindex]->codec;
-		pCodec = avcodec_find_decoder(pCodecCtx->codec_id);
-		if(pCodec == NULL)
-		{
-				cout<<"can't find codec "<<endl;
-				return false;
-		}
-		
-		if(avcodec_open2(pCodecCtx,pCodec,NULL) < 0)
-		{
-				cout<<"open codec error"<<endl;
-				return false;
-		}
-
-		//send 
-		unsigned char *body = new unsigned char[1024];
-		memset(body,0,1024);
-		int num = 0;
-		body[num++] = 0xAF;
-		body[num++] = 0x00;
-		//add AudioSpecificConfig 2bytes
-		//body[num] |= 0x18;
-		//body[num] |= 0x01;
-		//num++;
-		//body[num] |= 0x80;
-		//body[num] |= 0x18;
-		body[num++] = 0x12;
-		body[num++] = 0x10;
-		SendPacket(RTMP_PACKET_TYPE_AUDIO,(unsigned char*)body,num,0);
-		delete[] body;
-		while(1)
-		{
-				AVPacket packet;
-				if(av_read_frame(pFormatCtx,&packet) >= 0)
-				{
-						if(packet.stream_index == audioindex)
-						{
-								FILE *aacdata = NULL;
-								aacdata = fopen("aacdata","wb");
-								if(!aacdata)
-										return false;
-								fwrite(packet.data,1,packet.size,aacdata);
-								fclose(aacdata);
-								unsigned char* data = packet.data + 7;  //传送rawdata 跳过前面的7个adts字节
-								unsigned int num = packet.size - 7;
-								static int inc = 0;
-								int timestamp = /*inc++**/(1024*1000/44100);
-								pthread_mutex_lock(&audio_video_put_mutex);
-								if(m_currentAudioTime <= m_currentVideoTime)
-								{
-									m_currentAudioTime += timestamp;
-									SendAACPacket(data,num,0,m_currentAudioTime);
-									cout<<"send audio packet time is "<< m_currentAudioTime<<endl;
-									cout<<"m_audio is "<<m_currentAudioTime<<"m_video is "<<m_currentVideoTime<<endl;
-									if(m_currentAudioTime > m_currentVideoTime)
-									{
-										cout<<"connect video thread"<<endl;
-										pthread_mutex_unlock(&audio_video_put_mutex);
-										pthread_cond_signal(&cv);
-										usleep(10);
-										
-										
-										continue;
-									}
-									pthread_mutex_unlock(&audio_video_put_mutex);
-								}
-								else
-								{
-									m_currentAudioTime += timestamp;
-									pthread_cond_wait(&cv,&audio_video_put_mutex);
-									cout<<"Audio weak up"<<endl;
-									SendAACPacket(data,num,0,m_currentAudioTime);
-									pthread_mutex_unlock(&audio_video_put_mutex);
-								}	
-						}
-				}
-				else{
-						cout<<"send h264 data end"<<endl;
-						return true;
-				}
-		}
+		return true;
 }
 
-bool RtmpSmartPusher::SendH264()
+bool RtmpSmartPusher::startPush()
 {
-		av_register_all();
+	int ret = 0;
+	ret = pthread_create(&m_videoThread,NULL,do_audio_push_thread,this);
+	if(ret != 0)
+		return false;
+	ret = pthread_create(&m_audioThread,NULL,do_video_push_thread,this);
+	if(ret != 0)
+		return false;
+	ret = pthread_create(&m_pushThread,NULL,do_queue_push_thread,this);
+	if(ret != 0)
+		return false;
+	int audioover = 0;
+	int videoover = 0;
+	void *pvideoover = &videoover;
+	void *paudioover = &audioover;
+	pthread_join(m_audioThread,&(paudioover));
+	pthread_join(m_videoThread,&(pvideoover));
+	pthread_join(m_pushThread,NULL);
+
+}
+
+void* RtmpSmartPusher::do_queue_push_thread(void* arg)
+{
+	RtmpSmartPusher* rtmppusher = (RtmpSmartPusher*)arg;
+	rtmppusher->popQueueAndSendPacket();
+}
+
+void* RtmpSmartPusher::do_video_push_thread(void* arg)
+{
+	RtmpSmartPusher* rtmppusher = (RtmpSmartPusher*)arg;
+	rtmppusher->StartPusherH264();
+	rtmppusher->m_videoover = 1;
+	return &(rtmppusher->m_videoover);
+}
+
+void* RtmpSmartPusher::do_audio_push_thread(void* arg)
+{
+	RtmpSmartPusher* rtmppusher = (RtmpSmartPusher*)arg;
+	rtmppusher->StartPusherAAC();
+	rtmppusher->m_audioover = 1;
+	return &(rtmppusher->m_audioover);
+}
+
+
+bool RtmpSmartPusher::popQueueAndSendPacket()
+{
+	while(m_audioover == 0 || m_videoover == 0)
+	{
+		if(m_packetQueue.empty())
+		{
+			continue;
+		}
+		RTMPPacket* packet = m_packetQueue.front();
+		if(packet)
+		{
+			if (RTMP_IsConnected(m_rtmp))
+			{
+				cout<<"start send packet"<<endl;
+				int nRet = RTMP_SendPacket(m_rtmp,packet,TRUE); /*TRUE为放进发送队列,FALSE是不放进发送队列,直接发送*/
+				cout<<"over send packet"<<endl;
+			}
+		}
+		free(packet);
+		m_packetQueue.pop_front();
+	}
+	cout<<"RTMP video and audio data send over"<<endl;
+}
+
+bool RtmpSmartPusher::StartPusherAAC()
+{
+	AVFormatContext *pFormatCtx = NULL;
+	AVCodecContext *pCodecCtx = NULL;
+	AVCodec *pCodec = NULL;
+
+	pFormatCtx = avformat_alloc_context();
+	if(pFormatCtx == NULL)
+	{
+		cout<<"alloc format error"<<endl;
+		return false;
+	}
+	if(avformat_open_input(&pFormatCtx,"audio.aac",NULL,NULL) != 0)
+	{
+		cout<<"open input file error"<<endl;
+		return false;
+	}
+	if(avformat_find_stream_info(pFormatCtx,NULL) < 0 )
+	{
+		cout<<"find stream info error"<<endl;
+		return false;
+	}
+	int audioindex = -1;
+	for(int i = 0; i < pFormatCtx->nb_streams;i++)
+	{
+		if(pFormatCtx->streams[i]->codec->codec_type == AVMEDIA_TYPE_AUDIO)
+		{
+				audioindex = i;
+				break;
+		}
+	}
+	if(audioindex == -1)
+	{
+		cout<<"can't find any video"<<endl;
+		return false;
+	}
+	pCodecCtx = pFormatCtx->streams[audioindex]->codec;
+	pCodec = avcodec_find_decoder(pCodecCtx->codec_id);
+	if(pCodec == NULL)
+	{
+		cout<<"can't find codec "<<endl;
+		return false;
+	}
+		
+	if(avcodec_open2(pCodecCtx,pCodec,NULL) < 0)
+	{
+		cout<<"open codec error"<<endl;
+		return false;
+	}
+	senAudioSpecificConfig();
+	cout<<"send audio spec"<<endl;
+	while(1)
+	{
+			AVPacket packet;
+			if(av_read_frame(pFormatCtx,&packet) >= 0)
+			{
+					if(packet.stream_index == audioindex)
+					{
+						FILE *aacdata = NULL;
+						aacdata = fopen("aacdata","wb");
+						if(!aacdata)
+								return false;
+						fwrite(packet.data,1,packet.size,aacdata);
+						fclose(aacdata);
+						unsigned char* data = packet.data + 7;  //传送rawdata 跳过前面的7个adts字节
+						unsigned int num = packet.size - 7;
+						
+						static int inc = 0;
+						int timestamp = (inc++)*(1024*1000/44100);
+						cout<<"start read audio frame"<<endl;
+						pthread_mutex_lock(&m_lck);
+						cout<<"start in audio mutex"<<endl;
+						cout<<" audio thread m_audiotime is "<<m_audiotime<<endl;
+						cout<<"audio thread m_videotime is "<<m_videotime<<endl;
+						if(m_audiotime <= m_videotime)
+						{
+							m_audiotime = timestamp;
+							SendAACPacket(data,num,timestamp);
+							if(m_audiotime > m_videotime)
+							{
+								pthread_mutex_unlock(&m_lck);
+								pthread_cond_signal(&cv);
+								cout<<"unlock audio"<<endl;
+							}
+							pthread_mutex_unlock(&m_lck);						
+						}
+						else
+						{
+							cout<<"wait video arrive"<<endl;
+							if(m_videoover == 0)
+								pthread_cond_wait(&cv,&m_lck);
+							m_audiotime = timestamp;
+							SendAACPacket(data,num,timestamp);
+							pthread_mutex_unlock(&m_lck);
+						}
+					}
+			}
+			else
+			{
+				cout<<"send AAC data end"<<endl;
+				return true;
+			}
+	}
+	avcodec_close(pCodecCtx);
+	avformat_close_input(&pFormatCtx);
+}
+
+bool RtmpSmartPusher::SendAACPacket(unsigned char *data,unsigned int size,unsigned int nTimeStamp)
+{
+	unsigned char *body = new unsigned char[size + 2];
+	memset(body,0,size+2);
+	int num = 0;
+	body[num] = 0xAF;
+	num++;
+	body[num] = 0x01;
+	num++;
+	memcpy(body+2,data,size);
+	RTMPPacket* packet;
+	/*分配包内存和初始化,len为包体长度*/
+	packet = (RTMPPacket *)malloc(RTMP_HEAD_SIZE+size+2);
+	memset(packet,0,RTMP_HEAD_SIZE);
+	packet->m_body = (char *)packet + RTMP_HEAD_SIZE;
+	//memcpy(packet->m_body,data,size);
+
+	packet->m_packetType = RTMP_PACKET_TYPE_AUDIO;   
+	packet->m_nChannel = 0x04;    
+	packet->m_headerType = RTMP_PACKET_SIZE_LARGE;    
+	packet->m_nTimeStamp = nTimeStamp;    
+	packet->m_nInfoField2 = m_rtmp->m_stream_id;  
+	packet->m_nBodySize = size+2;
+	memcpy(packet->m_body,body,packet->m_nBodySize);
+	//cout<<"start send AAC packet"<<endl;
+	pthread_mutex_lock(&m_queuelck);
+	m_packetQueue.push_back(packet);
+	pthread_mutex_unlock(&m_queuelck);
+}
+
+bool RtmpSmartPusher::senAudioSpecificConfig()
+{
+	unsigned char *body = new unsigned char[1024];
+	memset(body,0,1024);
+	int num = 0;
+	body[num++] = 0xAF;
+	body[num++] = 0x00;
+	body[num++] = 0x12;
+	body[num++] = 0x10;
+	sendPacket(RTMP_PACKET_TYPE_AUDIO,(unsigned char*)body,num,0);
+	delete[] body;
+}
+
+bool RtmpSmartPusher::StartPusherH264()
+{
+		
 		AVFormatContext *pFormatCtx = NULL;
 		AVCodecContext *pCodecCtx = NULL;
 		AVCodec *pCodec = NULL;
@@ -297,92 +339,204 @@ bool RtmpSmartPusher::SendH264()
 		}
 		fclose(dump);
 		getSPSAndPPS(pCodecCtx->extradata,pCodecCtx->extradata_size);
+		cout<<"sps size is "<<m_264metadata.sps_size<<endl<<"pps size is "<<m_264metadata.pps_size<<endl;
+		bool iskey = false;
 		while(1)
 		{
 				AVPacket packet;
 				if(av_read_frame(pFormatCtx,&packet) >= 0)
 				{
 						if(packet.stream_index == videoindex)
-						{
-								FILE *h264data = NULL;
-								h264data = fopen("h264dara","wb");
-								if(!h264data)
-										return false;
-								fwrite(packet.data,1,packet.size,h264data);
-								fclose(h264data);
-								int hasspspps = 0;
-								if((packet.data[4] & 0x07) == 0x07 )
+						{	
+							if((packet.data[4] & 0x07) == 0x07 || (packet.data[4] & 0x08) == 0x08)
+							{
+								
+								packet.data = packet.data + pCodecCtx->extradata_size;
+								packet.size = packet.size - pCodecCtx->extradata_size;
+								
+							}
+							if(packet.flags & AV_PKT_FLAG_KEY)
+							{
+								iskey = true;
+							}
+							else{
+								iskey = false;
+							}
+							int last_update=RTMP_GetTime();
+							static int inc = 0;
+							int timestamp = (inc++)*(1000/15);
+							cout<<"start video frame read"<<endl;
+							pthread_mutex_lock(&m_lck);
+							cout<<"in video frame mutex"<<endl;
+							cout<<"m_audiotime is "<<m_audiotime<<endl;
+							cout<<"m_videotime is "<<m_videotime<<endl;
+							if(m_videotime <= m_audiotime)
+							{
+								m_videotime = timestamp;
+								sendRtmp264Packet(packet.data,packet.size,iskey,timestamp);
+								if(m_videotime > m_audiotime)
 								{
-										cout<<"exit sps"<<endl;
-										hasspspps = 1;
+									cout<<"lock video"<<endl;
+									pthread_mutex_unlock(&m_lck);
+									pthread_cond_signal(&cv);
+									cout<<"unlock video"<<endl;
 								}
-								bool iskey = false;
-								if(packet.flags & AV_PKT_FLAG_KEY)
-								{
-									iskey = true;
-								}
-								else{
-									iskey = false;
-								}
-								static int num = 0;
-								if(num == 0)
-								{
-										num++;
-										packet.data = packet.data + 22;
-										packet.size -= 22;
-								}
-								else if(hasspspps == 1)
-								{
-										packet.data = packet.data + 22;
-										packet.size -= 22;
-								}
-								static int inc = 0;
-								int timestamps = inc++*(1000/15);
-								pthread_mutex_lock(&audio_video_put_mutex);
-								if(m_currentVideoTime <= m_currentAudioTime)
-								{
-									if(!SendH264Packet(packet.data,packet.size,iskey,timestamps))
-									{
-										cout<<"send 264 data error"<<endl;
-										return false;
-									}
-									
-									m_currentVideoTime = timestamps;
-									cout<<"send video packet time is "<< m_currentVideoTime<<endl;
-									if(m_currentVideoTime > m_currentAudioTime)
-									{
-										cout<<"connect audio thread"<<endl;
-										pthread_mutex_unlock(&audio_video_put_mutex);
-										pthread_cond_signal(&cv);
-										continue;
-									}
-									pthread_mutex_unlock(&audio_video_put_mutex);
-								}
-								else
+								pthread_mutex_unlock(&m_lck);
+							}
+							else
+							{
+								cout<<"m_video is > m_audio"<<endl;
+								pthread_cond_wait(&cv,&m_lck);
+								m_videotime = timestamp;
+								sendRtmp264Packet(packet.data,packet.size,iskey,timestamp);
+								if(m_videotime > m_audiotime)
 								{
 									
-									int ret = pthread_cond_wait(&cv,&audio_video_put_mutex);
-									cout<<"video weak up"<<endl;
-									m_currentVideoTime = timestamps;
-									cout<<"after send video packet time is "<< timestamps<<endl;
-									if(!SendH264Packet(packet.data,packet.size,iskey,timestamps))
-									{
-										cout<<"send 264 data error"<<endl;
-										return false;
-									}
-									pthread_mutex_unlock(&audio_video_put_mutex);
+									pthread_mutex_unlock(&m_lck);
+									pthread_cond_signal(&cv);
+									continue;
 								}
-								//cout<<"video timestamps is "<<timestamps<<endl;
-								
-								
+								pthread_mutex_unlock(&m_lck);
+								cout<<"unlock video "<<endl;
+							}
+							int now=RTMP_GetTime();
 						}
+						
 				}
-				else{
-						cout<<"send h264 data end"<<endl;
-						return true;
+				else
+				{
+					cout<<"read 264 frame end"<<endl;
+					return true;
 				}
 		}
-		return true;
+	avcodec_close(pCodecCtx);
+	avformat_close_input(&pFormatCtx);
+	return true;
+}
+
+bool RtmpSmartPusher::sendRtmp264Packet(unsigned char* data, int size , bool iskeyframe,int nTimeStamp)
+{
+	if(data == NULL && size<11)
+	{  
+		return false;  
+	}
+	unsigned char *body = (unsigned char*)malloc(size+9);  
+	memset(body,0,size+9);
+	int i = 0;
+	if(iskeyframe == true)
+	{
+		body[i++] = 0x17;// 1:Iframe  7:AVC   
+		body[i++] = 0x01;// AVC NALU   
+		body[i++] = 0x00;  
+		body[i++] = 0x00;  
+		body[i++] = 0x00;  
+
+
+		// NALU size   
+		body[i++] = size>>24 &0xff;  
+		body[i++] = size>>16 &0xff;  
+		body[i++] = size>>8 &0xff;  
+		body[i++] = size&0xff;
+		// NALU data   
+		memcpy(&body[i],data,size);
+		sendRtmpspsppsPacket(m_264metadata.sps,m_264metadata.sps_size,m_264metadata.pps,m_264metadata.pps_size);
+	}
+	else
+	{
+		body[i++] = 0x27;// 2:Pframe  7:AVC   
+		body[i++] = 0x01;// AVC NALU   
+		body[i++] = 0x00;  
+		body[i++] = 0x00;  
+		body[i++] = 0x00;  
+
+		// NALU size   
+		body[i++] = size>>24 &0xff;  
+		body[i++] = size>>16 &0xff;  
+		body[i++] = size>>8 &0xff;  
+		body[i++] = size&0xff;
+		// NALU data   
+		memcpy(&body[i],data,size);
+	}
+	sendPacket(RTMP_PACKET_TYPE_VIDEO,body,i+size,nTimeStamp);
+	return true;
+}
+
+bool RtmpSmartPusher::sendPacket(unsigned int nPacketType,unsigned char *data,unsigned int size,unsigned int nTimestamp)
+{
+	RTMPPacket* packet;
+	/*分配包内存和初始化,len为包体长度*/
+	packet = (RTMPPacket *)malloc(RTMP_HEAD_SIZE+size);
+	memset(packet,0,RTMP_HEAD_SIZE);
+	packet->m_body = (char *)packet + RTMP_HEAD_SIZE;
+	memcpy(packet->m_body,data,size);
+	packet->m_nBodySize = size;
+	packet->m_hasAbsTimestamp = 0;
+	packet->m_packetType = nPacketType; /*此处为类型有两种一种是音频,一种是视频*/
+	packet->m_nInfoField2 = m_rtmp->m_stream_id;
+	packet->m_nChannel = 0x04;
+	packet->m_headerType = RTMP_PACKET_SIZE_LARGE;
+	packet->m_nTimeStamp = nTimestamp;
+	
+	pthread_mutex_lock(&m_queuelck);
+	m_packetQueue.push_back(packet);
+	pthread_mutex_unlock(&m_queuelck);
+	return true;
+}
+
+
+bool RtmpSmartPusher::sendRtmpspsppsPacket(unsigned char* sps, int sps_size,unsigned char* pps , int pps_size)
+{
+	RTMPPacket *packet = NULL;
+	packet = (RTMPPacket *)malloc(RTMP_HEAD_SIZE+1024);
+	unsigned char * body=NULL;
+	memset(packet,0,RTMP_HEAD_SIZE+1024);
+	packet->m_body = (char *)packet + RTMP_HEAD_SIZE;
+	body = (unsigned char *)packet->m_body;
+
+	int i = 0;
+	body[i++] = 0x17;
+	body[i++] = 0x00;
+
+	body[i++] = 0x00;
+	body[i++] = 0x00;
+	body[i++] = 0x00;
+
+	/*AVCDecoderConfigurationRecord*/
+	body[i++] = 0x01;
+	body[i++] = sps[1];
+	body[i++] = sps[2];
+	body[i++] = sps[3];
+	body[i++] = 0xff;
+
+	/*sps*/
+	body[i++]   = 0xe1;
+	body[i++] = (sps_size >> 8) & 0xff;
+	body[i++] = sps_size & 0xff;
+	memcpy(&body[i],sps,sps_size);
+	i +=  sps_size;
+
+	/*pps*/
+	body[i++]   = 0x01;
+	body[i++] = (pps_size >> 8) & 0xff;
+	body[i++] = (pps_size) & 0xff;
+	memcpy(&body[i],pps,pps_size);
+	i +=  pps_size;
+
+	packet->m_packetType = RTMP_PACKET_TYPE_VIDEO;
+	packet->m_nBodySize = i;
+	packet->m_nChannel = 0x04;
+	packet->m_nTimeStamp = 0;
+	packet->m_hasAbsTimestamp = 0;
+	packet->m_headerType = RTMP_PACKET_SIZE_LARGE;
+	packet->m_nInfoField2 = m_rtmp->m_stream_id;
+	pthread_mutex_lock(&m_queuelck);
+	m_packetQueue.push_back(packet);
+	pthread_mutex_unlock(&m_queuelck);
+	//int nRet = RTMP_SendPacket(m_rtmp,packet,0);
+	//packet->m_body = NULL;
+	//delete packet;
+	//free(packet);
+	return true;
 }
 
 void RtmpSmartPusher::getSPSAndPPS(const unsigned char* sps_pps_data,int size)
@@ -415,6 +569,9 @@ void RtmpSmartPusher::getSPSAndPPS(const unsigned char* sps_pps_data,int size)
 			return;
 		memset(sps,0,sps_size);
 		memcpy(sps,sps_pps_data+sps_start,sps_size);
+		m_264metadata.sps = sps;
+		m_264metadata.sps_size = sps_size;
+
 		for(int j = 0; j< sps_size;j++)
 		{
 				printf("%x",sps[j]);
@@ -424,166 +581,6 @@ void RtmpSmartPusher::getSPSAndPPS(const unsigned char* sps_pps_data,int size)
 			return;
 		memset(pps,0,ppssize);
 		memcpy(pps,sps_pps_data+pps_start,ppssize);
-
-		
-
-		//After Get sps pps need Packet send to RTMP server
-		
-		//int i = 0;
-		i =0;  
-		char body[1024];
-		body[i++] = 0x17; // 1:keyframe  7:AVC  
-		body[i++] = 0x00; // AVC sequence header  
-
-		body[i++] = 0x00;  
-		body[i++] = 0x00;  
-		body[i++] = 0x00; // fill in 0;  
-
-		body[i++] = 0x01; // configurationVersion  
-		body[i++] = sps[0]; // AVCProfileIndication  
-		body[i++] = sps[1]; // profile_compatibility  
-		body[i++] = sps[2]; // AVCLevelIndication   
-		body[i++] = 0xff; // lengthSizeMinusOne    
-		// sps nums  
-		body[i++] = 0xE1; //&0x1f  
-		// sps data length
-		body[i++] = sps_size >> 8; 
-
-		body[i++] = sps_size & 0xff;
-		// sps data  
-		memcpy(&body[i],sps,sps_size);  
-		i= i+sps_size;  
-
-		// pps nums  
-		body[i++] = 0x01; //&0x1f  
-		// pps data length 
-		body[i++] = ppssize >> 8;  
-		body[i++] = ppssize & 0xff;
-		// sps data  
-		memcpy(&body[i],pps,ppssize);  
-		i= i+ppssize;
-
-		if(!SendPacket(RTMP_PACKET_TYPE_VIDEO,(unsigned char*)body,i,0))
-		{
-				cout<<"send packet error"<<endl;
-				return ;
-		}
+		m_264metadata.pps = pps;
+		m_264metadata.pps_size = ppssize;
 }
-
-int RtmpSmartPusher::SendPacket(unsigned int nPacketType,unsigned char *data,unsigned int size,unsigned int nTimestamp)  
-{  
-		RTMPPacket packet;  
-		RTMPPacket_Reset(&packet);  
-		RTMPPacket_Alloc(&packet,size);  
-
-		packet.m_packetType = nPacketType;   
-		packet.m_nChannel = 0x04;    
-		packet.m_headerType = RTMP_PACKET_SIZE_LARGE;    
-		packet.m_nTimeStamp = nTimestamp;    
-		packet.m_nInfoField2 = m_rtmp->m_stream_id;  
-		packet.m_nBodySize = size;
-		memcpy(packet.m_body,data,size);
-		pthread_mutex_lock(&bufferlck);
-		m_Queue.push_back(packet);
-		pthread_mutex_unlock(&bufferlck);
-		//int nRet = RTMP_SendPacket(m_rtmp,&packet,0);  
-
-		//RTMPPacket_Free(&packet);  
-
-		return 1;  
-}  
-
-bool RtmpSmartPusher::SendAACPacket(unsigned char *data,unsigned int size,bool bIsKeyFrame,unsigned int nTimeStamp)
-{
-	unsigned char *body = new unsigned char[size + 2];
-	memset(body,0,size+2);
-	int num = 0;
-	body[num] = 0xAF;
-	num++;
-	body[num] = 0x01;
-	num++;
-	memcpy(body+2,data,size);
-	RTMPPacket packet;  
-	RTMPPacket_Reset(&packet);  
-	RTMPPacket_Alloc(&packet,size+2);  
-
-	packet.m_packetType = RTMP_PACKET_TYPE_AUDIO;   
-	packet.m_nChannel = 0x04;    
-	packet.m_headerType = RTMP_PACKET_SIZE_MEDIUM;    
-	packet.m_nTimeStamp = nTimeStamp;    
-	//packet.m_nInfoField2 = m_rtmp->m_stream_id;  
-	packet.m_nBodySize = size+2;
-	memcpy(packet.m_body,body,packet.m_nBodySize);
-	pthread_mutex_lock(&bufferlck);
-	m_Queue.push_back(packet);
-	pthread_mutex_unlock(&bufferlck);
-	//int nRet = RTMP_SendPacket(m_rtmp,&packet,0);  
-
-	//RTMPPacket_Free(&packet);
-	//SendPacket(RTMP_PACKET_TYPE_AUDIO,body,size+2,nTimeStamp);
-	delete[] body;
-}
-
-bool RtmpSmartPusher::SendH264Packet(unsigned char *data,unsigned int size,bool bIsKeyFrame,unsigned int nTimeStamp)  
-{  
-		if(data == NULL && size<11)  
-		{  
-				return false;  
-		}  
-
-		unsigned char *body = new unsigned char[size+9];  
-
-		int i = 0;  
-		if(bIsKeyFrame)  
-		{  
-				body[i++] = 0x17;// 1:Iframe  7:AVC  
-		}  
-		else  
-		{  
-				body[i++] = 0x27;// 2:Pframe  7:AVC  
-		}  
-		body[i++] = 0x01;// AVC NALU  
-		body[i++] = 0x00;  
-		body[i++] = 0x00;  
-		body[i++] = 0x00;  
-
-		// NALU size
-		size -= 4;
-		body[i++] = size>>24;
-		body[i++] = size>>16;  
-		body[i++] = size>>8;  
-		body[i++] = size&0xff;;  
-		FILE* framedata = NULL;
-		framedata = fopen("framedata","wb");
-		if(!framedata)
-				return 0;
-		fwrite(data+4,1,size,framedata);
-		fclose(framedata);
-		// NALU data  
-		memcpy(&body[i],data+4,size);
-
-
-		RTMPPacket packet;  
-		RTMPPacket_Reset(&packet);  
-		RTMPPacket_Alloc(&packet,size+i);  
-
-		packet.m_packetType = RTMP_PACKET_TYPE_VIDEO;   
-		packet.m_nChannel = 0x04;    
-		packet.m_headerType = RTMP_PACKET_SIZE_MEDIUM;    
-		packet.m_nTimeStamp = nTimeStamp;    
-		//packet.m_nInfoField2 = m_rtmp->m_stream_id;  
-		packet.m_nBodySize = i+size;
-		memcpy(packet.m_body,body,packet.m_nBodySize);
-		pthread_mutex_lock(&bufferlck);
-		m_Queue.push_back(packet);
-		pthread_mutex_unlock(&bufferlck);
-		//int nRet = RTMP_SendPacket(m_rtmp,&packet,0);  
-
-		//RTMPPacket_Free(&packet);
-		//bool bRet = SendPacket(RTMP_PACKET_TYPE_VIDEO,body,i+size,nTimeStamp);
-
-		delete[] body;  
-
-		return true;  
-}  
-
